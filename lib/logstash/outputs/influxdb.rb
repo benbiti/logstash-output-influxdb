@@ -59,6 +59,10 @@ class LogStash::Outputs::InfluxDB < LogStash::Outputs::Base
   # only useful when overriding the time value
   config :time_precision, :validate => ["m", "s", "u"], :default => "s"
 
+  # Tags
+
+  config :tags, :validate => :hash, :default => {}
+
   # Allow value coercion
   #
   # this will attempt to convert data point values to the appropriate type before posting
@@ -71,7 +75,7 @@ class LogStash::Outputs::InfluxDB < LogStash::Outputs::Base
 
   # This setting controls how many events will be buffered before sending a batch
   # of events. Note that these are only batched for the same series
-  config :flush_size, :validate => :number, :default => 100
+  config :flush_size, :validate => :number, :default => 5
 
   # The amount of time since last flush before a flush is forced.
   #
@@ -91,43 +95,31 @@ class LogStash::Outputs::InfluxDB < LogStash::Outputs::Base
     @agent = FTW::Agent.new
     @queue = []
 
-    @query_params = "u=#{@user}&p=#{@password.value}&time_precision=#{@time_precision}"
-    @base_url = "http://#{@host}:#{@port}/db/#{@db}/series"
+    @query_params = "db=#{@db}&u=#{@user}&p=#{@password.value}&time_precision=#{@time_precision}"
+    @base_url = "http://#{@host}:#{@port}/write"
     @url = "#{@base_url}?#{@query_params}"
 
     buffer_initialize(
-      :max_items => @flush_size,
-      :max_interval => @idle_flush_time,
-      :logger => @logger
+        :max_items => @flush_size,
+        :max_interval => @idle_flush_time,
+        :logger => @logger
     )
-  end # def register
+  end
+
+  # def register
 
   public
   def receive(event)
-    
+# A batch POST for InfluxDB looks like this:
+#measurement[,tag_key1=tag_value1...] field_key=field_value[,field_key2=field_value2] [timestamp]
+#disk_free value=11i 14353622999950
+#disk_free value=12i 14353623999950
 
-    # A batch POST for InfluxDB looks like this:
-    # [
-    #   {
-    #     "name": "events",
-    #     "columns": ["state", "email", "type"],
-    #     "points": [
-    #       ["ny", "paul@influxdb.org", "follow"],
-    #       ["ny", "todd@influxdb.org", "open"]
-    #     ]
-    #   },
-    #   {
-    #     "name": "errors",
-    #     "columns": ["class", "file", "user", "severity"],
-    #     "points": [
-    #       ["DivideByZero", "example.py", "someguy@influxdb.org", "fatal"]
-    #     ]
-    #   }
-    # ]
     event_hash = {}
     event_hash['name'] = event.sprintf(@series)
 
-    sprintf_points = Hash[@data_points.map {|k,v| [event.sprintf(k), event.sprintf(v)]}]
+    sprintf_points = Hash[@data_points.map { |k, v| [event.sprintf(k), event.sprintf(v)] }]
+
     if sprintf_points.has_key?('time')
       unless @allow_time_override
         logger.error("Cannot override value of time without 'allow_time_override'. Using event timestamp")
@@ -137,18 +129,19 @@ class LogStash::Outputs::InfluxDB < LogStash::Outputs::Base
       sprintf_points['time'] = event.timestamp.to_i
     end
 
+    #not check code below
     @coerce_values.each do |column, value_type|
       if sprintf_points.has_key?(column)
         begin
           case value_type
-          when "integer"
+            when "integer"
             @logger.debug? and @logger.debug("Converting column #{column} to type #{value_type}: Current value: #{sprintf_points[column]}")
-            sprintf_points[column] = sprintf_points[column].to_i
-          when "float"
+              sprintf_points[column] = sprintf_points[column].to_i
+            when "float"
             @logger.debug? and @logger.debug("Converting column #{column} to type #{value_type}: Current value: #{sprintf_points[column]}")
-            sprintf_points[column] = sprintf_points[column].to_f
-          else
-            @logger.error("Don't know how to convert to #{value_type}")
+              sprintf_points[column] = sprintf_points[column].to_f
+            else
+              @logger.error("Don't know how to convert to #{value_type}")
           end
         rescue => e
           @logger.error("Unhandled exception", :error => e.message)
@@ -156,12 +149,56 @@ class LogStash::Outputs::InfluxDB < LogStash::Outputs::Base
       end
     end
 
-    event_hash['columns'] = sprintf_points.keys
-    event_hash['points'] = []
-    event_hash['points'] << sprintf_points.values
+    line = ''
+    line.concat(event.sprintf(@series))
+    line.concat(",")
 
-    buffer_receive(event_hash)
-  end # def receive
+    @tags.each do |tag_field, tag_field_value|
+      tag_value=event.sprintf(tag_field_value)
+
+      if tag_value.nil?
+        @logger.debug? and @logger.debug("empty")
+      else
+        @logger.debug? and @logger.debug("tag value class == #{tag_value.class}")
+        if tag_value.class == String
+          @logger.debug? and @logger.debug(" #{tag_field} and value #{tag_field_value}: Current value: #{tag_value}")
+          line.concat(event.sprintf(tag_field))
+          line.concat("=\"")
+          line.concat(tag_value)
+          line.concat("\",")
+
+        elsif tag_value.class ==LogStash::Timestamp
+          line.concat("#{event.sprintf(tag_field)}=\"#{tag_value}\",")
+        else
+          line.concat("#{event.sprintf(tag_field)}=#{tag_value},")
+        end
+      end
+    end
+    line=line.chop()
+    line.concat(" ")
+    @data_points.each do |field, field_value|
+      value=event.sprintf(field_value)
+      if value.nil?
+        @logger.debug? and @logger.debug("empty")
+      else
+        if value.class == String
+          value=value.gsub('=', '\=')
+          line.concat(event.sprintf(field))
+          line.concat("=\"")
+          line.concat(value)
+          line.concat("\",")
+        elsif value.class ==LogStash::Timestamp
+          line.concat("#{event.sprintf(field)}=\"#{value}\",")
+        else
+          line.concat("#{event.sprintf(field)}=#{value},")
+        end
+      end
+    end
+    line = line.chop()
+    buffer_receive(line)
+  end
+
+  # def receive
 
   def flush(events, teardown = false)
     # seen_series stores a list of series and associated columns
@@ -169,61 +206,39 @@ class LogStash::Outputs::InfluxDB < LogStash::Outputs::Base
     # so that we can attempt to batch up points for a given series.
     #
     # Columns *MUST* be exactly the same
-    seen_series = {}
-    event_collection = []
-
     events.each do |ev|
-      begin
-        if seen_series.has_key?(ev['name']) and (seen_series[ev['name']] == ev['columns'])
-          @logger.info("Existing series data found. Appending points to that series")
-          event_collection.select {|h| h['points'] << ev['points'][0] if h['name'] == ev['name']}
-        elsif seen_series.has_key?(ev['name']) and (seen_series[ev['name']] != ev['columns'])
-          @logger.warn("Series '#{ev['name']}' has been seen but columns are different or in a different order. Adding to batch but not under existing series")
-          @logger.warn("Existing series columns were: #{seen_series[ev['name']].join(",")} and event columns were: #{ev['columns'].join(",")}")
-          event_collection << ev
-        else
-          seen_series[ev['name']] = ev['columns']
-          event_collection << ev
-        end
-      rescue => e
-        @logger.warn("Error adding event to collection", :exception => e)
-        next
-      end
+      post(ev)
     end
-
-    post(LogStash::Json.dump(event_collection))
-  end # def receive_bulk
+  end
 
   def post(body)
     begin
-      @logger.debug("Post body: #{body}")
+      @logger.debug? and @logger.error("Post body: #{body}")
       response = @agent.post!(@url, :body => body)
     rescue EOFError
       @logger.warn("EOF while writing request or reading response header from InfluxDB",
                    :host => @host, :port => @port)
       return # abort this flush
     end
-
     # Consume the body for error checking
     # This will also free up the connection for reuse.
-    body = ""
-    begin
-      response.read_body { |chunk| body += chunk }
-    rescue EOFError
-      @logger.warn("EOF while reading response body from InfluxDB",
-                   :host => @host, :port => @port)
-      return # abort this flush
-    end
-
-    if response.status != 200
+    if response.status != 204
       @logger.error("Error writing to InfluxDB",
                     :response => response, :response_body => body,
                     :request_body => @queue.join("\n"))
+      body = ""
+      begin
+        response.read_body { |chunk| body += chunk }
+      rescue EOFError
+        @logger.warn("EOF while reading response body from InfluxDB",
+                     :host => @host, :port => @port)
+        return # abort this flush
+      end
       return
     end
   end # def post
 
-  def close
+  def teardown
     buffer_flush(:final => true)
   end # def teardown
 end # class LogStash::Outputs::InfluxDB
